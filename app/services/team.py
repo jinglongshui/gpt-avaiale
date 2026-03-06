@@ -30,6 +30,32 @@ class TeamService:
         self.token_parser = TokenParser()
         self.jwt_parser = JWTParser()
 
+    def _is_transient_api_error(self, result: Dict[str, Any]) -> bool:
+        """判断是否为瞬时错误（限流/网络抖动/上游故障），避免误判为 Token 失效。"""
+        status_code = result.get("status_code")
+        error_msg = str(result.get("error", "")).lower()
+
+        if status_code in {408, 409, 425, 429}:
+            return True
+
+        if isinstance(status_code, int) and status_code >= 500:
+            return True
+
+        transient_keywords = [
+            "rate limit",
+            "too many requests",
+            "temporarily unavailable",
+            "timeout",
+            "timed out",
+            "connection reset",
+            "service unavailable",
+            "bad gateway",
+            "gateway timeout",
+            "cloudflare",
+            "cf-ray",
+        ]
+        return any(keyword in error_msg for keyword in transient_keywords)
+
     async def _handle_api_error(self, result: Dict[str, Any], team: Team, db_session: AsyncSession) -> bool:
         """
         检查结果是否表示账号被封禁、Token 失效或 Team 已满,如果是则更新状态
@@ -39,6 +65,14 @@ class TeamService:
         """
         error_code = result.get("error_code")
         error_msg = str(result.get("error", "")).lower()
+
+        # 0. 限流/网络抖动等瞬时错误：只记录日志，不累加错误次数，不降级状态
+        if self._is_transient_api_error(result):
+            logger.warning(
+                f"Team {team.id} ({team.email}) 遇到瞬时错误，不变更状态: "
+                f"status={result.get('status_code')}, msg={error_msg}"
+            )
+            return False
         
         # 1. 判定是否为“封号/永久失效”类致命错误
         # 明确的错误码匹配
@@ -143,9 +177,11 @@ class TeamService:
         Returns:
             有效的 AT Token, 刷新失败返回 None
         """
+        existing_access_token = None
         try:
             # 1. 解密当前 Token
             access_token = encryption_service.decrypt_token(team.access_token_encrypted)
+            existing_access_token = access_token
             
             # 2. 检查是否过期 (如果不强制刷新且未过期，则返回)
             if not force_refresh and not self.jwt_parser.is_token_expired(access_token):
@@ -158,6 +194,8 @@ class TeamService:
         except Exception as e:
             logger.error(f"解密或验证 Token 失败: {e}")
             access_token = None # 可能是解密失败，强制走刷新流程
+
+        last_refresh_error: Optional[Dict[str, Any]] = None
 
         # 3. 尝试使用 session_token 刷新
         if team.session_token_encrypted:
@@ -180,9 +218,13 @@ class TeamService:
                 await self._reset_error_status(team, db_session)
                 return new_at
             else:
-                # 检查是否为致命错误 (如 token_invalidated)
-                if await self._handle_api_error(refresh_result, team, db_session):
-                    return None
+                last_refresh_error = refresh_result
+                if self._is_transient_api_error(refresh_result):
+                    logger.warning(f"Team {team.id} 通过 session_token 刷新遇到瞬时错误，继续尝试 refresh_token")
+                else:
+                    # 检查是否为致命错误 (如 token_invalidated)
+                    if await self._handle_api_error(refresh_result, team, db_session):
+                        return None
 
         # 4. 尝试使用 refresh_token 刷新
         if team.refresh_token_encrypted and team.client_id:
@@ -201,9 +243,21 @@ class TeamService:
                 await self._reset_error_status(team, db_session)
                 return new_at
             else:
-                # 检查是否为致命错误 (如 account_deactivated)
-                if await self._handle_api_error(refresh_result, team, db_session):
-                    return None
+                last_refresh_error = refresh_result
+                if self._is_transient_api_error(refresh_result):
+                    logger.warning(f"Team {team.id} 通过 refresh_token 刷新遇到瞬时错误")
+                else:
+                    # 检查是否为致命错误 (如 account_deactivated)
+                    if await self._handle_api_error(refresh_result, team, db_session):
+                        return None
+
+        # 刷新失败但属于瞬时错误时，不将账号标记为过期；若旧 AT 仍可用则继续使用
+        if last_refresh_error and self._is_transient_api_error(last_refresh_error):
+            if existing_access_token and not self.jwt_parser.is_token_expired(existing_access_token):
+                logger.warning(f"Team {team.id} 刷新失败但属瞬时错误，回退旧 AT")
+                return existing_access_token
+            logger.warning(f"Team {team.id} 刷新 Token 失败但属于瞬时错误，保持当前状态")
+            return None
         
         if team.status != "banned":
             logger.error(f"Team {team.id} Token 已过期且无法刷新，标记为 expired")
@@ -843,20 +897,26 @@ class TeamService:
                         if account_result["success"]:
                             logger.info(f"Team {team.id} 自动刷新 Token 后重试同步成功")
                         else:
-                            # 刷新成功但请求依然失败，标记为过期/异常
-                            logger.error(f"Team {team.id} Token 刷新成功但获取账户信息仍失败，标记为 expired")
-                            team.status = "expired"
-                            await db_session.commit()
+                            # 刷新成功但请求依然失败：若为瞬时错误则不降级状态
+                            if self._is_transient_api_error(account_result):
+                                logger.warning(f"Team {team.id} 刷新后请求遇到瞬时错误，保持当前状态")
+                            else:
+                                logger.error(f"Team {team.id} Token 刷新成功但获取账户信息仍失败，标记为 expired")
+                                team.status = "expired"
+                                await db_session.commit()
                             return {
                                 "success": False,
                                 "message": None,
                                 "error": f"Token 刷新成功但获取账户信息仍失败: {account_result.get('error', '未知错误')}"
                             }
                     else:
-                        # 刷新失败，标记为过期
-                        logger.error(f"Team {team.id} Token 刷新失败，标记为 expired")
-                        team.status = "expired"
-                        await db_session.commit()
+                        # 刷新失败：若为瞬时错误则不降级状态
+                        if self._is_transient_api_error(account_result):
+                            logger.warning(f"Team {team.id} Token 刷新失败但属于瞬时错误，保持当前状态")
+                        else:
+                            logger.error(f"Team {team.id} Token 刷新失败，标记为 expired")
+                            team.status = "expired"
+                            await db_session.commit()
                         return {
                             "success": False,
                             "message": None,
@@ -958,7 +1018,7 @@ class TeamService:
                 return {
                     "success": False,
                     "message": None,
-                    "error": f"获取成员列表失败: {members_result['error']} (错误次数: {team.error_count})"
+                    "error": f"获取邀请列表失败: {invites_result['error']} (错误次数: {team.error_count})"
                 }
 
             # 6. 解析过期时间
